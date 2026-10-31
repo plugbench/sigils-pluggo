@@ -16,6 +16,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +28,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -105,14 +108,17 @@ int run_daemon(const struct options* defaults);
 /* Asks the daemon, starting it if it isn't running, and returns the exit status. */
 int ask_daemon(const struct options* options);
 
-/* Answers a client which connected to the daemon. */
-void handle_client(int fd, const struct options* defaults);
+/* A connection to NATS. */
+struct nats;
 
-/* Answers clients on the daemon's listening socket until something goes wrong. */
-int serve_clients(int listen_fd, const struct options* defaults);
+/*
+ * Answers the queries which have arrived, waiting up to timeout_ms (-1 for
+ * ever) for some, and returns 0, or -1 when the connection is gone.
+ */
+int serve_queries(struct nats* nc, const struct options* defaults, int timeout_ms);
 
-/* The backend's way of answering clients, which may also draw the sigils. */
-int serve(int listen_fd, const struct options* defaults);
+/* The backend's way of answering queries, which may also draw the sigils. */
+int serve(struct nats* nc, const struct options* defaults);
 
 /*
  * Appends the windows which are visible on a display to *windows, which is
@@ -164,8 +170,10 @@ static void usage(FILE* out)
           "id of its window, and fails if there isn't one.\n"
           "\n"
           "The windows come from a daemon, which is started if it isn't\n"
-          "running, on the socket $SIGILS_SOCKET, or else sigils.sock in the\n"
-          "user's temporary directory (macOS) or $XDG_RUNTIME_DIR (X).\n"
+          "running.  It answers through NATS, at $NATS_URL or else the local\n"
+          "server, with the token in $NATS_TOKEN, on cmd.get.sigils.<host>.\n"
+          "The one which runs holds the lock $SIGILS_LOCK, or else sigils.lock\n"
+          "in the user's temporary directory (macOS) or $XDG_RUNTIME_DIR (X).\n"
           "With --daemon, it runs that daemon, replacing one which is running,\n"
           "and on macOS it also draws the sigils over the windows, with\n"
           "\n"
@@ -602,20 +610,20 @@ done:
 /* --- daemon and clients ------------------------------------------------- */
 
 /*
- * The daemon and its clients.  A client sends its arguments, each ending in a
- * NUL, then an empty one, and the daemon answers with "status outlen errlen\n"
- * and then what `sigils` would print to stdout and stderr.  The daemon's -s
- * and -i are the only ones.
+ * The daemon and its clients talk through NATS, as the other pluggos do.  A
+ * client asks on cmd.get.sigils.<host> with a sigil, or with nothing to list
+ * them all, and the daemon answers with what `sigils` would print, or with
+ * "ERROR: " and why not.  The daemon's -s and -i are the only ones.
  *
- * Only one daemon runs per socket, the one holding a lock on the socket's
- * path with ".lock" added, which also holds its pid.  `sigils --daemon` stops
- * one which is running, but one which a query starts leaves it be.
+ * Only one daemon runs per host, the one holding a lock, which also holds its
+ * pid.  `sigils --daemon` stops one which is running, but one which a query
+ * starts leaves it be.
  */
-
 
 #define MAX_REQUEST 4096
 #define START_TIMEOUT_MS 5000
 #define STOP_TIMEOUT_MS 2000
+#define REPLY_TIMEOUT_MS 2000
 
 /*
  * The default mustn't depend on the environment, which differs between what
@@ -623,9 +631,9 @@ done:
  * daemon.  On macOS, that's the per-user temporary directory $TMPDIR is set
  * from, and elsewhere $XDG_RUNTIME_DIR, which the session sets for everything.
  */
-static int socket_path(char* path, size_t size)
+static int lock_path(char* path, size_t size)
 {
-    const char* env = getenv("SIGILS_SOCKET");
+    const char* env = getenv("SIGILS_LOCK");
     int n;
 
     if (env && *env)
@@ -638,43 +646,74 @@ static int socket_path(char* path, size_t size)
         char dir[PATH_MAX];
         size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir);
         if (len > 0 && len <= sizeof dir)
-            n = snprintf(path, size, "%s%ssigils.sock", dir,
+            n = snprintf(path, size, "%s%ssigils.lock", dir,
                          dir[strlen(dir) - 1] == '/' ? "" : "/");
         else
-            n = snprintf(path, size, "/tmp/sigils-%ld.sock", (long)getuid());
+            n = snprintf(path, size, "/tmp/sigils-%ld.lock", (long)getuid());
 #else
         const char* dir = getenv("XDG_RUNTIME_DIR");
         if (dir && *dir)
-            n = snprintf(path, size, "%s/sigils.sock", dir);
+            n = snprintf(path, size, "%s/sigils.lock", dir);
         else
-            n = snprintf(path, size, "/tmp/sigils-%ld.sock", (long)getuid());
+            n = snprintf(path, size, "/tmp/sigils-%ld.lock", (long)getuid());
 #endif
     }
-    if (n < 0 || (size_t)n >= size || (size_t)n >= sizeof((struct sockaddr_un*)0)->sun_path)
+    if (n < 0 || (size_t)n >= size)
     {
-        fprintf(stderr, "sigils: the socket path %s is too long\n", path);
+        fprintf(stderr, "sigils: the lock path %s is too long\n", path);
         return -1;
     }
     return 0;
 }
 
-static struct sockaddr_un address(const char* path)
+/* Where this host's daemon is asked.  Dots separate a subject's tokens, so the host stops at one. */
+static int query_subject(char* subject, size_t size)
 {
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    size_t len = strlen(path);
+    char host[256];
 
-    /* socket_path() has already turned away anything this long. */
-    if (len > sizeof addr.sun_path - 1)
-        len = sizeof addr.sun_path - 1;
-    memcpy(addr.sun_path, path, len);
-    return addr;
+    if (gethostname(host, sizeof host) < 0)
+    {
+        perror("sigils: gethostname");
+        return -1;
+    }
+    host[sizeof host - 1] = '\0';
+    host[strcspn(host, ". \t*>")] = '\0';
+    snprintf(subject, size, "cmd.get.sigils.%s", host);
+    return 0;
 }
 
-static int write_all(int fd, const char* data, size_t len)
+/* --- NATS --------------------------------------------------------------- */
+
+/* Just enough of the NATS client protocol: a token, subscribing, and publishing. */
+
+struct nats
+{
+    int fd;
+    char* buf;
+    size_t start, len, size; /* what's yet to be parsed is buf[start..len) */
+    int infos, pongs;
+};
+
+struct nats_msg
+{
+    char sid[32];
+    char reply[256];
+    int status; /* from the headers, or 0 */
+    const char* data; /* in the connection's buffer, until it next reads */
+    size_t len;
+};
+
+static int nats_write(struct nats* nc, const char* data, size_t len)
 {
     while (len > 0)
     {
-        ssize_t n = write(fd, data, len);
+        ssize_t n = write(nc->fd, data, len);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            struct pollfd p = { nc->fd, POLLOUT, 0 };
+            poll(&p, 1, REPLY_TIMEOUT_MS);
+            continue;
+        }
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
@@ -685,87 +724,269 @@ static int write_all(int fd, const char* data, size_t len)
     return 0;
 }
 
-/* Reads until EOF, into a buffer which is grown with realloc. */
-static ssize_t read_all(int fd, char** data, size_t limit)
+static int nats_writes(struct nats* nc, const char* s)
 {
-    size_t len = 0, size = 0;
+    return nats_write(nc, s, strlen(s));
+}
 
-    *data = NULL;
+static int nats_sub(struct nats* nc, const char* subject, const char* sid)
+{
+    char line[512];
+    int n = snprintf(line, sizeof line, "SUB %s %s\r\n", subject, sid);
+
+    return n < 0 || (size_t)n >= sizeof line ? -1 : nats_write(nc, line, (size_t)n);
+}
+
+static int nats_pub(struct nats* nc, const char* subject, const char* reply, const char* data,
+                    size_t len)
+{
+    char line[600];
+    int n = snprintf(line, sizeof line, "PUB %s%s%s %zu\r\n", subject, reply ? " " : "",
+                     reply ? reply : "", len);
+
+    if (n < 0 || (size_t)n >= sizeof line)
+        return -1;
+    if (nats_write(nc, line, (size_t)n) < 0 || nats_write(nc, data, len) < 0)
+        return -1;
+    return nats_write(nc, "\r\n", 2);
+}
+
+/*
+ * Reads what has arrived, waiting up to timeout_ms (-1 for ever) for
+ * something.  Returns 1, 0 if nothing came, or -1 if the connection is gone.
+ */
+static int nats_fill(struct nats* nc, int timeout_ms)
+{
+    if (nc->start > 0)
+    {
+        memmove(nc->buf, nc->buf + nc->start, nc->len - nc->start);
+        nc->len -= nc->start;
+        nc->start = 0;
+    }
+    if (nc->len == nc->size)
+    {
+        size_t size = nc->size ? 2 * nc->size : 4096;
+        char* grown = realloc(nc->buf, size);
+        if (!grown)
+            return -1;
+        nc->buf = grown;
+        nc->size = size;
+    }
+
+    struct pollfd p = { nc->fd, POLLIN, 0 };
+    int ready = poll(&p, 1, timeout_ms);
+    if (ready <= 0)
+        return ready < 0 && errno != EINTR ? -1 : 0;
+    ssize_t n = read(nc->fd, nc->buf + nc->len, nc->size - nc->len);
+    if (n < 0)
+        return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+    if (n == 0)
+        return -1;
+    nc->len += (size_t)n;
+    return 1;
+}
+
+/*
+ * Parses the next message from what has been read, into *m, answering pings
+ * on the way.  Returns 1, 0 if more has to be read first, or -1 if the server
+ * gave up on us.
+ */
+static int nats_next(struct nats* nc, struct nats_msg* m)
+{
     for (;;)
     {
-        if (len == size)
+        const char* line = nc->buf + nc->start;
+        size_t avail = nc->len - nc->start;
+        const char* crlf = avail ? memmem(line, avail, "\r\n", 2) : NULL;
+        char ctl[1024];
+
+        if (!crlf)
+            return avail >= sizeof ctl ? -1 : 0;
+        size_t ctl_len = (size_t)(crlf - line);
+        if (ctl_len >= sizeof ctl)
+            return -1;
+        memcpy(ctl, line, ctl_len);
+        ctl[ctl_len] = '\0';
+        size_t after = ctl_len + 2;
+
+        if (!strncmp(ctl, "MSG ", 4) || !strncmp(ctl, "HMSG ", 5))
         {
-            size = size ? 2 * size : 1024;
-            if (limit && size > limit)
-                size = limit;
-            if (len == size)
-                break;
-            char* grown = realloc(*data, size + 1);
-            if (!grown)
-                goto fail;
-            *data = grown;
+            int headers = ctl[0] == 'H';
+            char *fields[7], *save;
+            int n = 0;
+
+            for (char* f = strtok_r(ctl, " \t", &save); f && n < 7; f = strtok_r(NULL, " \t", &save))
+                fields[n++] = f;
+            int min = headers ? 5 : 4;
+            if (n < min || n > min + 1)
+                return -1;
+            size_t total = strtoul(fields[n - 1], NULL, 10);
+            size_t header_len = headers ? strtoul(fields[n - 2], NULL, 10) : 0;
+            if (header_len > total)
+                return -1;
+            if (avail < after + total + 2)
+                return 0;
+
+            const char* payload = line + after;
+            *m = (struct nats_msg){ 0 };
+            snprintf(m->sid, sizeof m->sid, "%s", fields[2]);
+            snprintf(m->reply, sizeof m->reply, "%s", n == min + 1 ? fields[3] : "");
+            if (header_len > 9 && !memcmp(payload, "NATS/1.0 ", 9))
+                m->status = atoi(payload + 9);
+            m->data = payload + header_len;
+            m->len = total - header_len;
+            nc->start += after + total + 2;
+            return 1;
         }
-        ssize_t n = read(fd, *data + len, size - len);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0)
-            goto fail;
-        if (n == 0)
-            break;
-        len += (size_t)n;
+        nc->start += after;
+        if (!strncmp(ctl, "PING", 4))
+        {
+            if (nats_writes(nc, "PONG\r\n") < 0)
+                return -1;
+        }
+        else if (!strncmp(ctl, "PONG", 4))
+        {
+            nc->pongs++;
+        }
+        else if (!strncmp(ctl, "INFO", 4))
+        {
+            nc->infos++;
+        }
+        else if (!strncmp(ctl, "-ERR", 4))
+        {
+            fprintf(stderr, "sigils: NATS says %s\n", ctl + (ctl_len > 5 ? 5 : ctl_len));
+            return -1;
+        }
     }
-    if (!*data && !(*data = malloc(1)))
-        return -1;
-    (*data)[len] = '\0';
-    return (ssize_t)len;
-fail:
-    free(*data);
-    *data = NULL;
-    return -1;
 }
 
-static void respond(int fd, int status, const char* out, size_t outlen, const char* err,
-                    size_t errlen)
+/* Reads until *counter, which nats_next counts, goes up, or returns -1. */
+static int nats_await(struct nats* nc, int* counter)
 {
-    char header[64];
-    int n = snprintf(header, sizeof header, "%d %zu %zu\n", status, outlen, errlen);
+    int before = *counter;
+    struct nats_msg m;
 
-    if (write_all(fd, header, (size_t)n) == 0 && write_all(fd, out, outlen) == 0)
-        write_all(fd, err, errlen);
-}
-
-void handle_client(int fd, const struct options* defaults)
-{
-    struct timeval timeout = { .tv_sec = 2 };
-    char *request = NULL, *out = NULL, *err = NULL;
-    size_t outlen = 0, errlen = 0;
-    char* argv[MAX_REQUEST / 2 + 2];
-    int argc = 0;
-
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
-    ssize_t len = read_all(fd, &request, MAX_REQUEST);
-    if (len < 1 || request[len - 1] != '\0')
+    while (*counter == before)
     {
-        free(request);
-        return;
+        if (nats_next(nc, &m) < 0 || (*counter == before && nats_fill(nc, REPLY_TIMEOUT_MS) <= 0))
+            return -1;
+    }
+    return 0;
+}
+
+static void json_string(char* out, size_t size, const char* s)
+{
+    size_t n = 0;
+
+    out[n++] = '"';
+    for (; *s && n + 8 < size; s++)
+    {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')
+            n += (size_t)snprintf(out + n, size - n, "\\%c", c);
+        else if (c < 0x20)
+            n += (size_t)snprintf(out + n, size - n, "\\u%04x", c);
+        else
+            out[n++] = (char)c;
+    }
+    out[n++] = '"';
+    out[n] = '\0';
+}
+
+/* Connects to $NATS_URL, or else the local server, with the token in $NATS_TOKEN. */
+static int nats_connect(struct nats* nc)
+{
+    const char* url = getenv("NATS_URL");
+    char host[256] = "127.0.0.1", port[16] = "4222";
+
+    if (url && *url)
+    {
+        const char* rest = strstr(url, "://") ? strstr(url, "://") + 3 : url;
+        size_t host_len = strcspn(rest, ":/");
+        if (host_len > 0 && host_len < sizeof host)
+        {
+            memcpy(host, rest, host_len);
+            host[host_len] = '\0';
+        }
+        if (rest[host_len] == ':')
+            snprintf(port, sizeof port, "%.*s", (int)strcspn(rest + host_len + 1, "/"),
+                     rest + host_len + 1);
     }
 
-    argv[argc++] = "sigils";
-    for (char* arg = request; arg < request + len && *arg; arg += strlen(arg) + 1)
-        argv[argc++] = arg;
-    argv[argc] = NULL;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *addrs;
+    int gai = getaddrinfo(host, port, &hints, &addrs);
+    if (gai != 0)
+    {
+        fprintf(stderr, "sigils: can't find NATS at %s:%s: %s\n", host, port, gai_strerror(gai));
+        return -1;
+    }
+    nc->fd = -1;
+    for (struct addrinfo* a = addrs; a && nc->fd < 0; a = a->ai_next)
+    {
+        nc->fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (nc->fd >= 0 && connect(nc->fd, a->ai_addr, a->ai_addrlen) < 0)
+        {
+            close(nc->fd);
+            nc->fd = -1;
+        }
+    }
+    freeaddrinfo(addrs);
+    if (nc->fd < 0)
+    {
+        fprintf(stderr, "sigils: can't reach NATS at %s:%s: %s\n", host, port, strerror(errno));
+        return -1;
+    }
+    int on = 1;
+    setsockopt(nc->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+
+    const char* token = getenv("NATS_TOKEN");
+    char token_json[1024] = "";
+    if (token && *token)
+    {
+        char quoted[1000];
+        json_string(quoted, sizeof quoted, token);
+        snprintf(token_json, sizeof token_json, ",\"auth_token\":%s", quoted);
+    }
+    char connect[1200];
+    snprintf(connect, sizeof connect,
+             "CONNECT {\"verbose\":false,\"pedantic\":false,\"name\":\"sigils\",\"lang\":\"c\","
+             "\"version\":\"0.1.0\",\"protocol\":1,\"headers\":true,\"no_responders\":true%s}"
+             "\r\nPING\r\n",
+             token_json);
+    if (nats_await(nc, &nc->infos) < 0 || nats_writes(nc, connect) < 0 ||
+        nats_await(nc, &nc->pongs) < 0)
+    {
+        fprintf(stderr, "sigils: NATS at %s:%s didn't let us in\n", host, port);
+        return -1;
+    }
+    return 0;
+}
+
+/* --- answering queries -------------------------------------------------- */
+
+static void answer_query(struct nats* nc, const struct nats_msg* m, const struct options* defaults)
+{
+    struct options options = { .sigils = defaults->sigils, .reserved = defaults->reserved };
+    char sigil[2] = "";
+    char *out = NULL, *err = NULL;
+    size_t outlen = 0, errlen = 0;
+    int status = 1;
 
     FILE* outf = open_memstream(&out, &outlen);
     FILE* errf = open_memstream(&err, &errlen);
-    int status = 1;
     if (outf && errf)
     {
-        struct options options;
-        status = parse_options(argc, argv, &options, errf);
-        if (status == 0)
+        if (m->len > 1)
         {
-            options.sigils = defaults->sigils;
-            options.reserved = defaults->reserved;
+            fprintf(errf, "sigils: a sigil is one character\n");
+        }
+        else
+        {
+            if (m->len == 1)
+            {
+                sigil[0] = m->data[0];
+                options.sigil = sigil;
+            }
             status = answer(&options, outf, errf);
         }
     }
@@ -773,28 +994,41 @@ void handle_client(int fd, const struct options* defaults)
         fclose(outf);
     if (errf)
         fclose(errf);
-    respond(fd, status, out ? out : "", out ? outlen : 0, err ? err : "", err ? errlen : 0);
+
+    if (status == 0)
+    {
+        nats_pub(nc, m->reply, NULL, out, outlen);
+    }
+    else
+    {
+        /* Clients put back the "sigils: ". */
+        const char* why = err && errlen ? err : "sigils: can't answer\n";
+        if (!strncmp(why, "sigils: ", 8))
+            why += 8;
+        char reply[1024];
+        int n = snprintf(reply, sizeof reply, "ERROR: %.*s", (int)strcspn(why, "\n"), why);
+        nats_pub(nc, m->reply, NULL, reply, n < 0 ? 0 : (size_t)n >= sizeof reply ? sizeof reply - 1 : (size_t)n);
+    }
     free(out);
     free(err);
-    free(request);
 }
 
-int serve_clients(int listen_fd, const struct options* defaults)
+int serve_queries(struct nats* nc, const struct options* defaults, int timeout_ms)
 {
-    for (;;)
+    struct nats_msg m;
+    int r;
+
+    if (nats_fill(nc, timeout_ms) < 0)
+        return -1;
+    while ((r = nats_next(nc, &m)) > 0)
     {
-        int fd = accept(listen_fd, NULL, NULL);
-        if (fd < 0)
-        {
-            if (errno == EINTR || errno == ECONNABORTED)
-                continue;
-            perror("sigils: accept");
-            return 1;
-        }
-        handle_client(fd, defaults);
-        close(fd);
+        if (*m.reply)
+            answer_query(nc, &m, defaults);
     }
+    return r;
 }
+
+/* --- the daemon --------------------------------------------------------- */
 
 /* Stops the daemon holding the lock, and takes the lock, or returns -1. */
 static int stop_daemon(int lock)
@@ -821,17 +1055,16 @@ static int stop_daemon(int lock)
 
 int run_daemon(const struct options* defaults)
 {
-    char path[PATH_MAX], lock_path[PATH_MAX + 8];
+    char path[PATH_MAX], subject[300];
 
-    if (socket_path(path, sizeof path) < 0)
+    if (lock_path(path, sizeof path) < 0 || query_subject(subject, sizeof subject) < 0)
         return 1;
-    snprintf(lock_path, sizeof lock_path, "%s.lock", path);
 
     umask(077);
-    int lock = open(lock_path, O_RDWR | O_CREAT, 0600);
+    int lock = open(path, O_RDWR | O_CREAT, 0600);
     if (lock < 0)
     {
-        fprintf(stderr, "sigils: can't open %s: %s\n", lock_path, strerror(errno));
+        fprintf(stderr, "sigils: can't open %s: %s\n", path, strerror(errno));
         return 1;
     }
     if (flock(lock, LOCK_EX | LOCK_NB) < 0)
@@ -851,17 +1084,11 @@ int run_daemon(const struct options* defaults)
             dprintf(lock, "-i\n%s\n", defaults->insets);
     }
 
-    /* Holding the lock, any socket left there is from a daemon which died. */
-    unlink(path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = address(path);
-    if (fd < 0 || bind(fd, (struct sockaddr*)&addr, sizeof addr) < 0 || listen(fd, 16) < 0)
-    {
-        fprintf(stderr, "sigils: can't listen on %s: %s\n", path, strerror(errno));
-        return 1;
-    }
+    struct nats nc = { .fd = -1 };
     signal(SIGPIPE, SIG_IGN);
-    return serve(fd, defaults);
+    if (nats_connect(&nc) < 0 || nats_sub(&nc, subject, "1") < 0)
+        return 1;
+    return serve(&nc, defaults);
 }
 
 static int executable_path(char* path, size_t size)
@@ -883,14 +1110,12 @@ static int executable_path(char* path, size_t size)
 #endif
 }
 
-/* The -s and -i of the last daemon on this socket, from its lock, after its pid. */
+/* The -s and -i of the last daemon, from its lock, after its pid. */
 static int last_daemon_options(const char* path, char* saved, size_t size, char** argv, int max)
 {
-    char lock_path[PATH_MAX + 8];
     int argc = 0;
 
-    snprintf(lock_path, sizeof lock_path, "%s.lock", path);
-    FILE* lock = fopen(lock_path, "r");
+    FILE* lock = fopen(path, "r");
     if (!lock)
         return 0;
     size_t n = fread(saved, 1, size - 1, lock);
@@ -910,14 +1135,14 @@ static int last_daemon_options(const char* path, char* saved, size_t size, char*
 }
 
 /* Starts a daemon, detached from this process, with the last one's -s and -i. */
-static void start_daemon(const char* path)
+static void start_daemon(void)
 {
-    char exe[PATH_MAX];
+    char exe[PATH_MAX], path[PATH_MAX];
     char saved[MAX_REQUEST];
     char* argv[8] = { exe, "--daemon-unless-running" };
     int argc = 2;
 
-    if (executable_path(exe, sizeof exe) < 0)
+    if (executable_path(exe, sizeof exe) < 0 || lock_path(path, sizeof path) < 0)
         return;
     argc += last_daemon_options(path, saved, sizeof saved, argv + argc, 4);
     argv[argc] = NULL;
@@ -942,98 +1167,91 @@ static void start_daemon(const char* path)
         waitpid(pid, NULL, 0);
 }
 
-static int connect_to(const char* path)
-{
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = address(path);
+/* --- clients ------------------------------------------------------------ */
 
-    if (fd < 0)
-        return -1;
-    if (connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0)
-    {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-    return fd;
+static long now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-static int connect_or_start(const char* path)
+/* Waits for the reply on sid, returning 1, 0 if there was none in time, or -1. */
+static int await_reply(struct nats* nc, const char* sid, struct nats_msg* m)
 {
-    int fd = connect_to(path);
+    long deadline = now_ms() + REPLY_TIMEOUT_MS;
 
-    if (fd >= 0 || (errno != ENOENT && errno != ECONNREFUSED))
-        return fd;
-    start_daemon(path);
-    for (int waited = 0; waited < START_TIMEOUT_MS; waited += 10)
+    for (;;)
     {
-        struct timespec ten_ms = { 0, 10 * 1000 * 1000 };
-        if ((fd = connect_to(path)) >= 0)
-            return fd;
-        nanosleep(&ten_ms, NULL);
+        int r = nats_next(nc, m);
+        if (r < 0)
+            return -1;
+        if (r > 0 && !strcmp(m->sid, sid))
+            return 1;
+        if (r > 0)
+            continue;
+        long left = deadline - now_ms();
+        if (left <= 0)
+            return 0;
+        if (nats_fill(nc, (int)left) < 0)
+            return -1;
     }
-    return -1;
 }
 
 int ask_daemon(const struct options* options)
 {
-    char path[PATH_MAX];
-    char* response = NULL;
-    ssize_t got;
-    int status, n = 0;
-    size_t outlen, errlen;
-
-    if (socket_path(path, sizeof path) < 0)
-        return 1;
-    int fd = connect_or_start(path);
-    if (fd < 0)
-    {
-        fprintf(stderr, "sigils: can't reach the daemon at %s: %s\n", path, strerror(errno));
-        return 1;
-    }
-
-    char request[MAX_REQUEST];
-    size_t len = 0;
-    const char* args[] = {
-        options->sigil ? "--" : NULL,
-        options->sigil,
-    };
-    for (size_t i = 0; i < sizeof args / sizeof args[0]; i += 2)
-    {
-        if (!args[i])
-            continue;
-        for (size_t j = i; j < i + 2; j++)
-        {
-            size_t arglen = strlen(args[j]) + 1;
-            if (len + arglen + 1 > sizeof request)
-            {
-                fprintf(stderr, "sigils: arguments are too long\n");
-                close(fd);
-                return 2;
-            }
-            memcpy(request + len, args[j], arglen);
-            len += arglen;
-        }
-    }
-    request[len++] = '\0';
+    struct nats nc = { .fd = -1 };
+    struct nats_msg m;
+    char subject[300], inbox[64];
+    const char* data = options->sigil ? options->sigil : "";
+    int started = 0;
 
     signal(SIGPIPE, SIG_IGN);
-    if (write_all(fd, request, len) < 0 || shutdown(fd, SHUT_WR) < 0 ||
-        (got = read_all(fd, &response, 0)) < 0 ||
-        sscanf(response, "%d %zu %zu\n%n", &status, &outlen, &errlen, &n) != 3 || n == 0 ||
-        (size_t)(got - n) < outlen + errlen)
+    if (query_subject(subject, sizeof subject) < 0 || nats_connect(&nc) < 0)
+        return 1;
+    snprintf(inbox, sizeof inbox, "_INBOX.sigils.%ld.%ld", (long)getpid(), now_ms());
+    if (nats_sub(&nc, inbox, "1") < 0)
+        goto lost;
+
+    for (long start = now_ms();;)
     {
-        fprintf(stderr, "sigils: the daemon at %s didn't answer\n", path);
-        free(response);
-        close(fd);
+        if (nats_pub(&nc, subject, inbox, data, strlen(data)) < 0)
+            goto lost;
+        int r = await_reply(&nc, "1", &m);
+        if (r < 0)
+            goto lost;
+        if (r == 0)
+        {
+            fprintf(stderr, "sigils: the daemon didn't answer on %s\n", subject);
+            return 1;
+        }
+        /* No responders: nothing is subscribed, so there's no daemon yet. */
+        if (m.status != 503)
+            break;
+        if (!started)
+        {
+            start_daemon();
+            started = 1;
+        }
+        if (now_ms() - start > START_TIMEOUT_MS)
+        {
+            fprintf(stderr, "sigils: no daemon answers on %s\n", subject);
+            return 1;
+        }
+        struct timespec ten_ms = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ten_ms, NULL);
+    }
+
+    if (m.len >= 7 && !memcmp(m.data, "ERROR: ", 7))
+    {
+        fprintf(stderr, "sigils: %.*s\n", (int)(m.len - 7), m.data + 7);
         return 1;
     }
-    fwrite(response + n, 1, outlen, stdout);
-    fwrite(response + n + outlen, 1, errlen, stderr);
-    free(response);
-    close(fd);
-    return status;
+    fwrite(m.data, 1, m.len, stdout);
+    return 0;
+lost:
+    fprintf(stderr, "sigils: lost the connection to NATS\n");
+    return 1;
 }
 
 #if defined(SIGILS_FAKE)
@@ -1120,9 +1338,12 @@ int list_displays(struct rect** displays, size_t* count)
     return 0;
 }
 
-int serve(int listen_fd, const struct options* defaults)
+int serve(struct nats* nc, const struct options* defaults)
 {
-    return serve_clients(listen_fd, defaults);
+    while (serve_queries(nc, defaults, -1) == 0)
+        ;
+    fprintf(stderr, "sigils: lost the connection to NATS\n");
+    return 1;
 }
 
 #elif defined(__APPLE__) && !defined(SIGILS_X11)
@@ -1952,33 +2173,36 @@ static void watch_workspace(void)
     }
 }
 
-static void client_waiting(CFFileDescriptorRef ref, CFOptionFlags flags, void* info)
-{
-    int listen_fd = CFFileDescriptorGetNativeDescriptor(ref);
-    int fd;
+static struct nats* queries;
 
+static void queries_waiting(CFFileDescriptorRef ref, CFOptionFlags flags, void* info)
+{
     (void)flags;
     (void)info;
-    while ((fd = accept(listen_fd, NULL, NULL)) >= 0)
+    void* pool = objc_autoreleasePoolPush();
+    int lost = serve_queries(queries, drawing_options, 0) < 0;
+    objc_autoreleasePoolPop(pool);
+    if (lost)
     {
-        void* pool = objc_autoreleasePoolPush();
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-        handle_client(fd, drawing_options);
-        close(fd);
-        objc_autoreleasePoolPop(pool);
+        /* A query starts another daemon once NATS is back. */
+        fprintf(stderr, "sigils: lost the connection to NATS\n");
+        exit(1);
     }
     CFFileDescriptorEnableCallBacks(ref, kCFFileDescriptorReadCallBack);
 }
 
-int serve(int listen_fd, const struct options* options)
+int serve(struct nats* nc, const struct options* options)
 {
+    int fd = nc->fd;
+
     drawing_options = options;
-    fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL) | O_NONBLOCK);
+    queries = nc;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
     id app = MSG(id)(cls("NSApplication"), sel("sharedApplication"));
     MSG(BOOL, long)(app, sel("setActivationPolicy:"), NSApplicationActivationPolicyAccessory);
 
-    CFFileDescriptorRef ref = CFFileDescriptorCreate(NULL, listen_fd, false, client_waiting, NULL);
+    CFFileDescriptorRef ref = CFFileDescriptorCreate(NULL, fd, false, queries_waiting, NULL);
     CFRunLoopSourceRef source = CFFileDescriptorCreateRunLoopSource(NULL, ref, 0);
     CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
     CFFileDescriptorEnableCallBacks(ref, kCFFileDescriptorReadCallBack);
@@ -2200,9 +2424,12 @@ int list_windows(struct window** windows, size_t* count)
     return result;
 }
 
-int serve(int listen_fd, const struct options* defaults)
+int serve(struct nats* nc, const struct options* defaults)
 {
-    return serve_clients(listen_fd, defaults);
+    while (serve_queries(nc, defaults, -1) == 0)
+        ;
+    fprintf(stderr, "sigils: lost the connection to NATS\n");
+    return 1;
 }
 
 #endif

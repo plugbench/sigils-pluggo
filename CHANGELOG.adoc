@@ -1,0 +1,8 @@
+Changes
+=======
+
+Unreleased
+----------
+* The daemon answers through NATS, on `cmd.get.sigils.<host>`, instead of on a
+  socket of its own.  `$SIGILS_LOCK` replaces `$SIGILS_SOCKET`.
+* Moved out of eraserhd/dotfiles.

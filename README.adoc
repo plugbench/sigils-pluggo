@@ -1,0 +1,33 @@
+sigils-pluggo
+=============
+
+Names the windows on the screen, and the empty spaces between them, with a
+character each, so that a window manager can jump to one by its character.
+
+----
+sigils                sigil id x y width height app title
+sigils <sigil>        the id of the window with that sigil
+sigils --daemon [-s sigils] [-i edge=pixels,...]
+----
+
+The answers come from a daemon, which a query starts if it isn't running, so
+that it can be started with the permissions to see the windows (on macOS,
+those of the window manager which starts it), and keep the sigils drawn over
+them.  On macOS it draws them; on X, the window manager does.
+
+Like the other pluggos, the daemon answers through NATS, on the local server
+with the token in `$NATS_TOKEN` (or at `$NATS_URL`).  Windows are a host's own,
+so it answers on `cmd.get.sigils.<host>`, where the host is the host name up to
+its first dot:
+
+`cmd.get.sigils.<host>`::
+  With a sigil, replies with the id of its window.  With nothing, replies with
+  the list.  Otherwise replies `ERROR: ...`.
+
+Building
+--------
+
+----
+$ make            # or make check, which needs nats-server
+$ nix build
+----

@@ -18,6 +18,7 @@
         };
         devShells.default = pkgs.mkShell {
           inputsFrom = [ sigils-pluggo ];
+          nativeBuildInputs = [ pkgs.nats-server ];
         };
     })) // {
       overlays.default = final: prev: {

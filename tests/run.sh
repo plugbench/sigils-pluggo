@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests `sigils`, built with the fake backend, given as $1.
+# Tests `sigils`, built with the fake backend, given as $1, against a
+# nats-server of its own.
 
 set -u
 
@@ -7,9 +8,21 @@ sigils=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 failures=0
 tests=0
 
+nats_dir=$(mktemp -d "${TMPDIR:-/tmp}/sigils-nats.XXXXXX")
+nats_port=$((20000 + RANDOM % 20000))
+export NATS_URL=nats://127.0.0.1:$nats_port NATS_TOKEN=s3cret
+nats-server -a 127.0.0.1 -p "$nats_port" --auth "$NATS_TOKEN" >"$nats_dir/log" 2>&1 &
+nats_pid=$!
+disown
+trap 'kill "$nats_pid" 2>/dev/null; rm -rf "$nats_dir"' EXIT
+until grep -q 'Server is ready' "$nats_dir/log"; do
+    kill -0 "$nats_pid" 2>/dev/null || { cat "$nats_dir/log"; exit 1; }
+    sleep 0.01
+done
+
 setup() {
     dir=$(mktemp -d "${TMPDIR:-/tmp}/sigils.XXXXXX")
-    export SIGILS_SOCKET=$dir/s.sock
+    export SIGILS_LOCK=$dir/sigils.lock
     export SIGILS_FAKE_WINDOWS=$dir/windows
     cat >"$SIGILS_FAKE_WINDOWS" <<'WINDOWS'
 display 0 0 1000 800
@@ -20,12 +33,13 @@ WINDOWS
 
 start_daemon() {
     "$sigils" --daemon "$@" &
+    local pid=$!
     disown
-    while [[ ! -S $SIGILS_SOCKET ]]; do sleep 0.01; done
+    while [[ $(daemon_pid) != "$pid" ]]; do sleep 0.01; done
 }
 
 daemon_pid() {
-    head -1 "$SIGILS_SOCKET.lock" 2>/dev/null
+    head -1 "$SIGILS_LOCK" 2>/dev/null
 }
 
 teardown() {
@@ -99,7 +113,7 @@ rejects_s_and_i_for_queries() {
     status=$?
     expect_eq "$status" 2
     expect_eq "$err" "sigils: -s and -i are only for --daemon"
-    [[ -S $SIGILS_SOCKET ]] && fail "a daemon was started"
+    [[ -s $SIGILS_LOCK ]] && fail "a daemon was started"
 }
 
 leaves_out_empty_spaces_smaller_than_twenty_pixels() {
@@ -117,7 +131,6 @@ gives_no_sigils_to_bars_and_decorations_or_the_space_they_cover() {
 
 starts_a_daemon_when_none_is_running() {
     "$sigils" >/dev/null
-    [[ -S $SIGILS_SOCKET ]] || fail "no socket at $SIGILS_SOCKET"
     kill -0 "$(daemon_pid)" 2>/dev/null || fail "no daemon running"
 }
 
@@ -180,12 +193,28 @@ replaces_a_running_daemon() {
 
 # On macOS, the default is the user's real temporary directory, which a test
 # can't have to itself.
-puts_the_socket_in_xdg_runtime_dir_by_default_off_macos() {
+puts_the_lock_in_xdg_runtime_dir_by_default_off_macos() {
     [[ $(uname) == Darwin ]] && return
-    unset SIGILS_SOCKET
+    unset SIGILS_LOCK
     XDG_RUNTIME_DIR=$dir "$sigils" >/dev/null
-    [[ -S $dir/sigils.sock ]] || fail "no socket at $dir/sigils.sock"
-    SIGILS_SOCKET=$dir/sigils.sock
+    [[ -s $dir/sigils.lock ]] || fail "no lock at $dir/sigils.lock"
+    SIGILS_LOCK=$dir/sigils.lock
+}
+
+fails_when_nats_cant_be_reached() {
+    local err status
+    err=$(NATS_URL=nats://127.0.0.1:1 "$sigils" a 2>&1)
+    status=$?
+    expect_eq "$status" 1
+    [[ $err == "sigils: can't reach NATS at 127.0.0.1:1: "* ]] || fail "expected can't reach, got [$err]"
+}
+
+fails_with_the_wrong_token() {
+    local err status
+    err=$(NATS_TOKEN=wrong "$sigils" a 2>&1)
+    status=$?
+    expect_eq "$status" 1
+    [[ $err == *"Authorization Violation"* ]] || fail "expected an authorization violation, got [$err]"
 }
 
 prints_usage_for_an_unknown_option() {
