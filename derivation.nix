@@ -4,7 +4,8 @@
 }:
 
 stdenv.mkDerivation {
-  name = "sigils";
+  pname = "sigils-pluggo";
+  version = "0.1.0";
   src = ./.;
   buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ libx11 ];
   makeFlags = [ "PREFIX=$(out)" ];
